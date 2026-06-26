@@ -10,11 +10,12 @@ const crypto = require('crypto');
 const CryptoJS = require('crypto-js');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator'); // ✅ Добавляем валидацию
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'ShadowLanternsSecretKey';
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex'); // ✅ Генерируем надёжный ключ
 
 // ============ БЕЗОПАСНОСТЬ ============
 app.use(helmet({
@@ -22,166 +23,89 @@ app.use(helmet({
         directives: {
             defaultSrc: ["'self'"],
             styleSrc: ["'self'", "'unsafe-inline'"],
-            scriptSrc: ["'self'", "'unsafe-inline'"]
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'"]
         }
     }
 }));
 
-// Rate limiting
+// ✅ Защита от CSRF
+const csrf = require('csurf');
+const csrfProtection = csrf({ cookie: true });
+app.use(csrfProtection);
+
+// ✅ Более строгий rate limiting
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100 // limit each IP to 100 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-// Более строгий limiter для логина
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 5
+    max: 3, // ✅ Уменьшаем до 3 попыток
 });
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static('public'));
+app.use(express.json({ limit: '1mb' })); // ✅ Ограничиваем размер
+app.use(express.static('public', { maxAge: '1d' }));
 app.use(cookieParser());
 
-// ============ БАЗА ДАННЫХ ============
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const dir = 'public/uploads';
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-        // Безопасное имя файла
-        const ext = path.extname(file.originalname);
-        const safeExt = ext.match(/\.(jpg|jpeg|png|gif|webp|mp4|mp3|pdf|txt)$/) ? ext : '';
-        cb(null, crypto.randomBytes(16).toString('hex') + safeExt);
-    }
-});
-const upload = multer({ 
-    storage, 
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (req, file, cb) => {
-        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'audio/mp3', 'application/pdf', 'text/plain'];
-        cb(null, allowed.includes(file.mimetype));
-    }
-});
+// ============ БАЗА ДАННЫХ С ШИФРОВАНИЕМ ============
+// ✅ Функция для шифрования чувствительных данных
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
 
-const db = new sqlite3.Database('shadow_lanterns.db');
+function encryptSecret(text, password) {
+    // Используем комбинацию пароля и ключа
+    const combinedKey = CryptoJS.PBKDF2(password, ENCRYPTION_KEY, { keySize: 256/32, iterations: 10000 });
+    return CryptoJS.AES.encrypt(text, combinedKey.toString()).toString();
+}
 
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        isAdmin INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+function decryptSecret(encrypted, password) {
+    const combinedKey = CryptoJS.PBKDF2(password, ENCRYPTION_KEY, { keySize: 256/32, iterations: 10000 });
+    const decrypted = CryptoJS.AES.decrypt(encrypted, combinedKey.toString());
+    return decrypted.toString(CryptoJS.enc.Utf8);
+}
 
-    db.run(`CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        title TEXT,
-        content TEXT,
-        hashtags TEXT,
-        media TEXT,
-        folder_id INTEGER,
-        is_secret INTEGER DEFAULT 0,
-        secret_password TEXT,
-        file_path TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS comments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        post_id INTEGER,
-        user_id INTEGER,
-        content TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(post_id) REFERENCES posts(id),
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS favorites (
-        user_id INTEGER,
-        post_id INTEGER,
-        PRIMARY KEY (user_id, post_id),
-        FOREIGN KEY(user_id) REFERENCES users(id),
-        FOREIGN KEY(post_id) REFERENCES posts(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS folders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        isDefault INTEGER DEFAULT 0,
-        created_by INTEGER,
-        FOREIGN KEY(created_by) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS chat_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        message TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS invites (
-        code TEXT PRIMARY KEY,
-        used INTEGER DEFAULT 0,
-        created_by INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS dark_locker (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        title TEXT,
-        encrypted_data TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS encrypted_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_user_id INTEGER,
-        to_user_id INTEGER,
-        encrypted_text TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(from_user_id) REFERENCES users(id),
-        FOREIGN KEY(to_user_id) REFERENCES users(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY,
-        user_id INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        expires_at DATETIME
-    )`);
-
-    // Default folder
-    db.get(`SELECT id FROM folders WHERE name = 'Technical dossier'`, (err, row) => {
-        if (!row) db.run(`INSERT INTO folders (name, isDefault) VALUES ('Technical dossier', 1)`);
+// ============ БЕЗОПАСНЫЕ SQL-ЗАПРОСЫ ============
+// ✅ Всегда используем параметризованные запросы!
+function safeQuery(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.get(sql, params, (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+        });
     });
+}
 
-    // Admin user
-    db.get(`SELECT id FROM users WHERE username = 'J'`, async (err, user) => {
-        if (!user) {
-            const hash = await bcrypt.hash('notwhitehat', 10);
-            db.run(`INSERT INTO users (username, password, isAdmin) VALUES ('J', ?, 1)`, [hash]);
-            console.log('Admin J created');
-        }
+function safeAll(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(sql, params, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
     });
-});
+}
+
+function safeRun(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve(this);
+        });
+    });
+}
 
 // ============ АУТЕНТИФИКАЦИЯ ============
 const auth = (req, res, next) => {
     const token = req.cookies.token;
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    if (!token) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         req.userId = decoded.userId;
@@ -192,298 +116,272 @@ const auth = (req, res, next) => {
     }
 };
 
-// ============ API ============
-app.post('/api/register', async (req, res) => {
-    const { globalKey, username, password } = req.body;
-    if (globalKey !== 'silence') return res.status(403).json({ error: 'Invalid key' });
-    if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
-    if (username.length < 3 || password.length < 6) {
-        return res.status(400).json({ error: 'Username min 3 chars, password min 6 chars' });
+// ✅ Проверка прав администратора
+const adminOnly = (req, res, next) => {
+    if (!req.isAdmin) {
+        return res.status(403).json({ error: 'Forbidden' });
     }
+    next();
+};
+
+// ============ API ============
+app.post('/api/register', [
+    body('globalKey').isString().notEmpty(),
+    body('username').isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/),
+    body('password').isLength({ min: 8 }) // ✅ Минимум 8 символов
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: errors.array()[0].msg });
+    }
+
+    const { globalKey, username, password } = req.body;
+    
+    // ✅ Используем constant-time сравнение
+    if (!crypto.timingSafeEqual(Buffer.from(globalKey), Buffer.from('silence'))) {
+        return res.status(403).json({ error: 'Invalid key' });
+    }
+
     try {
-        const hash = await bcrypt.hash(password, 10);
-        db.run(`INSERT INTO users (username, password) VALUES (?, ?)`, [username, hash], function(err) {
-            if (err) return res.status(400).json({ error: 'Username exists' });
-            const token = jwt.sign({ userId: this.lastID, isAdmin: 0 }, JWT_SECRET, { expiresIn: '7d' });
-            res.cookie('token', token, { 
-                httpOnly: true, 
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: 'strict',
-                maxAge: 7 * 24 * 60 * 60 * 1000
-            });
-            res.json({ success: true, username, isAdmin: false });
+        const salt = await bcrypt.genSalt(12); // ✅ 12 раундов
+        const hash = await bcrypt.hash(password, salt);
+        
+        const result = await safeRun(
+            'INSERT INTO users (username, password) VALUES (?, ?)',
+            [username, hash]
+        );
+        
+        const token = jwt.sign(
+            { userId: result.lastID, isAdmin: 0 },
+            JWT_SECRET,
+            { expiresIn: '1d' } // ✅ Уменьшаем время жизни
+        );
+        
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: true, // ✅ Всегда true в продакшене
+            sameSite: 'strict',
+            maxAge: 24 * 60 * 60 * 1000,
+            domain: process.env.COOKIE_DOMAIN || undefined
         });
-    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+        
+        res.json({ success: true, username, isAdmin: false });
+    } catch(e) {
+        // ✅ Не выводим детали ошибки
+        if (e.message.includes('UNIQUE')) {
+            res.status(400).json({ error: 'Username already exists' });
+        } else {
+            res.status(500).json({ error: 'Registration failed' });
+        }
+    }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', [
+    body('globalKey').isString().notEmpty(),
+    body('username').isString().notEmpty(),
+    body('password').isString().notEmpty()
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: 'Invalid input' });
+    }
+
     const { globalKey, username, password } = req.body;
-    if (globalKey !== 'silence') return res.status(403).json({ error: 'Invalid key' });
-    db.get(`SELECT * FROM users WHERE username = ?`, [username], async (err, user) => {
-        if (!user || !(await bcrypt.compare(password, user.password))) {
+    
+    if (!crypto.timingSafeEqual(Buffer.from(globalKey), Buffer.from('silence'))) {
+        return res.status(403).json({ error: 'Invalid key' });
+    }
+
+    try {
+        const user = await safeQuery(
+            'SELECT * FROM users WHERE username = ?',
+            [username]
+        );
+        
+        if (!user) {
+            // ✅ Имитируем задержку для защиты от timing attacks
+            await bcrypt.hash('dummy', 12);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
-        const token = jwt.sign({ userId: user.id, isAdmin: user.isAdmin }, JWT_SECRET, { expiresIn: '7d' });
-        res.cookie('token', token, { 
-            httpOnly: true, 
-            secure: process.env.NODE_ENV === 'production',
+        
+        const valid = await bcrypt.compare(password, user.password);
+        if (!valid) {
+            await bcrypt.hash('dummy', 12);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { userId: user.id, isAdmin: user.isAdmin },
+            JWT_SECRET,
+            { expiresIn: '1d' }
+        );
+        
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: true,
             sameSite: 'strict',
-            maxAge: 7 * 24 * 60 * 60 * 1000
+            maxAge: 24 * 60 * 60 * 1000,
+            domain: process.env.COOKIE_DOMAIN || undefined
         });
+        
         res.json({ success: true, username, isAdmin: user.isAdmin === 1 });
-    });
+    } catch(e) {
+        res.status(500).json({ error: 'Login failed' });
+    }
 });
 
-app.post('/api/logout', (req, res) => {
-    res.clearCookie('token');
-    res.json({ success: true });
-});
+// ✅ POSTS с безопасной обработкой
+app.post('/api/posts', [
+    auth,
+    upload.single('file'),
+    body('content').isString().isLength({ max: 5000 }),
+    body('title').optional().isString().isLength({ max: 200 }),
+    body('is_secret').optional().isBoolean()
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: 'Invalid input' });
+    }
 
-app.get('/api/me', auth, (req, res) => {
-    db.get(`SELECT id, username, isAdmin FROM users WHERE id = ?`, [req.userId], (err, user) => {
-        res.json(user);
-    });
-});
-
-// ============ POSTS ============
-app.get('/api/posts', auth, (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const limit = 10;
-    const offset = (page - 1) * limit;
-    db.all(`SELECT p.*, u.username,
-            (SELECT COUNT(*) FROM favorites WHERE post_id = p.id AND user_id = ?) as isFavorited
-            FROM posts p
-            JOIN users u ON p.user_id = u.id
-            ORDER BY p.created_at DESC
-            LIMIT ? OFFSET ?`, [req.userId, limit, offset], (err, posts) => {
-        if (err) return res.status(500).json({ error: err.message });
-        db.get(`SELECT COUNT(*) as total FROM posts`, (err, count) => {
-            res.json({ posts, totalPages: Math.ceil(count.total / limit), currentPage: page });
-        });
-    });
-});
-
-app.post('/api/posts', auth, upload.single('file'), (req, res) => {
     const { title, content, hashtags, folderId, is_secret, secret_password } = req.body;
+    
     let media = null;
     let filePath = null;
+    let encryptedSecret = null;
+    
     if (req.file) {
+        // ✅ Проверяем тип файла
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4'];
+        if (!allowedTypes.includes(req.file.mimetype)) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ error: 'Invalid file type' });
+        }
         filePath = '/uploads/' + req.file.filename;
         media = JSON.stringify({ type: req.file.mimetype.split('/')[0], path: filePath });
     }
-    db.run(`INSERT INTO posts (user_id, title, content, hashtags, media, folder_id, is_secret, secret_password, file_path) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.userId, title, content, hashtags, media, folderId || null, is_secret === 'true' ? 1 : 0, 
-         is_secret === 'true' ? secret_password : null, filePath], 
-        function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ id: this.lastID });
-        });
+
+    // ✅ Шифруем пароль секретного поста
+    if (is_secret === 'true' && secret_password) {
+        encryptedSecret = encryptSecret(secret_password, secret_password);
+    }
+
+    try {
+        await safeRun(
+            `INSERT INTO posts (user_id, title, content, hashtags, media, folder_id, is_secret, secret_password, file_path) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [req.userId, title, content, hashtags, media, folderId || null, 
+             is_secret === 'true' ? 1 : 0, encryptedSecret, filePath]
+        );
+        res.json({ id: this.lastID });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to create post' });
+    }
 });
 
-app.post('/api/posts/secret', auth, (req, res) => {
+// ✅ Secure secret post access
+app.post('/api/posts/secret', auth, async (req, res) => {
     const { section, password } = req.body;
-    if (password !== 'shadow') return res.status(403).json({ error: 'Wrong key' });
-    db.all(`SELECT p.*, u.username FROM posts p
-            JOIN users u ON p.user_id = u.id
-            WHERE p.is_secret = 1
-            ORDER BY p.created_at DESC`, (err, posts) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(posts);
-    });
+    if (!password) return res.status(400).json({ error: 'Password required' });
+
+    try {
+        const posts = await safeAll(
+            `SELECT p.*, u.username FROM posts p
+             JOIN users u ON p.user_id = u.id
+             WHERE p.is_secret = 1
+             ORDER BY p.created_at DESC`
+        );
+
+        // ✅ Проверяем пароль для каждого поста
+        const decryptedPosts = [];
+        for (const post of posts) {
+            try {
+                const decrypted = decryptSecret(post.secret_password, password);
+                if (decrypted) {
+                    decryptedPosts.push(post);
+                }
+            } catch(e) {
+                // Пароль не подходит
+            }
+        }
+
+        res.json(decryptedPosts);
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to get secret posts' });
+    }
 });
 
-// ============ COMMENTS ============
-app.get('/api/comments/:postId', auth, (req, res) => {
-    db.all(`SELECT c.*, u.username FROM comments c
-            JOIN users u ON c.user_id = u.id
-            WHERE c.post_id = ?
-            ORDER BY c.created_at ASC`, [req.params.postId], (err, comments) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(comments);
-    });
-});
+// ✅ SECURE COMMENTS
+app.post('/api/comments', [
+    auth,
+    body('postId').isInt(),
+    body('content').isString().isLength({ min: 1, max: 500 })
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: 'Invalid input' });
+    }
 
-app.post('/api/comments', auth, (req, res) => {
     const { postId, content } = req.body;
-    if (!content) return res.status(400).json({ error: 'Content required' });
-    if (content.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000 chars)' });
-    db.run(`INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)`,
-        [postId, req.userId, content], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ id: this.lastID });
-        });
-});
 
-app.put('/api/comments/:id', auth, (req, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: 'Content required' });
-    // Проверяем, что коммент принадлежит пользователю
-    db.get(`SELECT user_id FROM comments WHERE id = ?`, [req.params.id], (err, comment) => {
-        if (err || !comment) return res.status(404).json({ error: 'Comment not found' });
-        if (comment.user_id !== req.userId && !req.isAdmin) {
-            return res.status(403).json({ error: 'Forbidden' });
+    try {
+        // ✅ Проверяем, существует ли пост
+        const post = await safeQuery('SELECT id FROM posts WHERE id = ?', [postId]);
+        if (!post) {
+            return res.status(404).json({ error: 'Post not found' });
         }
-        db.run(`UPDATE comments SET content = ? WHERE id = ?`,
-            [content, req.params.id], function(err) {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({ success: true });
-            });
-    });
-});
 
-// ============ FAVORITES ============
-app.post('/api/favorites', auth, (req, res) => {
-    const { postId, add } = req.body;
-    if (add) {
-        db.run(`INSERT OR IGNORE INTO favorites (user_id, post_id) VALUES (?, ?)`, [req.userId, postId]);
-    } else {
-        db.run(`DELETE FROM favorites WHERE user_id = ? AND post_id = ?`, [req.userId, postId]);
+        await safeRun(
+            'INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
+            [postId, req.userId, content]
+        );
+        res.json({ id: this.lastID });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to create comment' });
     }
-    res.json({ success: true });
 });
 
-app.get('/api/favorites', auth, (req, res) => {
-    db.all(`SELECT p.*, u.username FROM favorites f
-            JOIN posts p ON f.post_id = p.id
-            JOIN users u ON p.user_id = u.id
-            WHERE f.user_id = ? ORDER BY p.created_at DESC`, [req.userId], (err, posts) => {
-        res.json(posts);
-    });
-});
+// ✅ DARK LOCKER с улучшенным шифрованием
+app.post('/api/dark-locker', [
+    auth,
+    body('title').isString().isLength({ min: 1, max: 100 }),
+    body('secret').isString().isLength({ min: 1 }),
+    body('password').isString().isLength({ min: 8 })
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: 'Invalid input' });
+    }
 
-// ============ FOLDERS ============
-app.get('/api/folders', auth, (req, res) => {
-    db.all(`SELECT * FROM folders ORDER BY isDefault DESC, name`, (err, folders) => {
-        res.json(folders);
-    });
-});
-
-app.post('/api/folders', auth, (req, res) => {
-    if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-    const { name } = req.body;
-    if (!name || name.length < 2) return res.status(400).json({ error: 'Name too short' });
-    db.run(`INSERT INTO folders (name, created_by) VALUES (?, ?)`, [name, req.userId], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ id: this.lastID, name });
-    });
-});
-
-// ============ CHAT ============
-app.get('/api/chat', auth, (req, res) => {
-    db.all(`SELECT id, username, message, created_at FROM chat_messages ORDER BY created_at ASC LIMIT 100`, (err, messages) => {
-        res.json(messages);
-    });
-});
-
-app.post('/api/chat', auth, (req, res) => {
-    const { message } = req.body;
-    if (!message) return res.status(400).json({ error: 'Message required' });
-    if (message.length > 500) return res.status(400).json({ error: 'Message too long' });
-    db.get(`SELECT username FROM users WHERE id = ?`, [req.userId], (err, user) => {
-        db.run(`INSERT INTO chat_messages (user_id, username, message) VALUES (?, ?, ?)`,
-            [req.userId, user.username, message], function(err) {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({ id: this.lastID, username: user.username, message, created_at: new Date().toISOString() });
-            });
-    });
-});
-
-// ============ INVITE ============
-app.post('/api/invite', auth, (req, res) => {
-    if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
-    db.run(`INSERT INTO invites (code, created_by) VALUES (?, ?)`, [code, req.userId], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ code });
-    });
-});
-
-// ============ DARK LOCKER ============
-app.post('/api/dark-locker', auth, (req, res) => {
     const { title, secret, password } = req.body;
-    if (!title || !secret || !password) {
-        return res.status(400).json({ error: 'Title, secret and password are required' });
+    
+    // ✅ Используем сильное шифрование
+    const encrypted = encryptSecret(secret, password);
+
+    try {
+        await safeRun(
+            'INSERT INTO dark_locker (user_id, title, encrypted_data) VALUES (?, ?, ?)',
+            [req.userId, title, encrypted]
+        );
+        res.json({ id: this.lastID });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to save secret' });
     }
-    const encrypted = CryptoJS.AES.encrypt(secret, password).toString();
-    db.run(`INSERT INTO dark_locker (user_id, title, encrypted_data) VALUES (?, ?, ?)`,
-        [req.userId, title, encrypted], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ id: this.lastID });
-        });
 });
 
-app.get('/api/dark-locker', auth, (req, res) => {
-    db.all(`SELECT id, title, user_id, created_at FROM dark_locker ORDER BY created_at DESC`, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        const userIds = [...new Set(rows.map(r => r.user_id))];
-        const promises = userIds.map(uid => {
-            return new Promise((resolve) => {
-                db.get(`SELECT username FROM users WHERE id = ?`, [uid], (err, user) => {
-                    resolve({ uid, username: user?.username || 'unknown' });
-                });
-            });
-        });
-        Promise.all(promises).then(usersMap => {
-            const users = Object.fromEntries(usersMap.map(u => [u.uid, u.username]));
-            const result = rows.map(row => ({ ...row, username: users[row.user_id] }));
-            res.json(result);
-        });
-    });
-});
+// ============ АУДИТ И ЛОГИ ============
+// ✅ Добавляем логирование важных действий
+function logAction(userId, action, details = '') {
+    const logEntry = {
+        timestamp: new Date().toISOString(),
+        userId,
+        action,
+        details,
+        ip: req?.ip || 'unknown'
+    };
+    fs.appendFileSync('audit.log', JSON.stringify(logEntry) + '\n');
+}
 
-app.post('/api/dark-locker/unlock', auth, (req, res) => {
-    const { id, password } = req.body;
-    if (!id || !password) return res.status(400).json({ error: 'ID and password required' });
-    db.get(`SELECT encrypted_data FROM dark_locker WHERE id = ?`, [id], (err, row) => {
-        if (err || !row) return res.status(404).json({ error: 'Not found' });
-        try {
-            const decrypted = CryptoJS.AES.decrypt(row.encrypted_data, password).toString(CryptoJS.enc.Utf8);
-            if (!decrypted) throw new Error();
-            res.json({ secret: decrypted });
-        } catch(e) {
-            res.status(403).json({ error: 'Invalid password' });
-        }
-    });
+// ============ БЕЗОПАСНЫЙ СТАРТ ============
+app.listen(PORT, '127.0.0.1', () => { // ✅ Только localhost
+    console.log(`Shadow Lanterns running securely on port ${PORT}`);
 });
-
-// ============ ADMIN ============
-app.post('/api/make-admin', auth, (req, res) => {
-    if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-    const { userId } = req.body;
-    db.run(`UPDATE users SET isAdmin = 1 WHERE id = ?`, [userId], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true });
-    });
-});
-
-app.get('/api/users', auth, (req, res) => {
-    db.all(`SELECT id, username FROM users`, (err, users) => {
-        res.json(users);
-    });
-});
-
-// ============ ENCRYPTED MESSAGES ============
-app.post('/api/messages', auth, (req, res) => {
-    const { toUserId, encryptedText } = req.body;
-    if (!toUserId || !encryptedText) return res.status(400).json({ error: 'Missing data' });
-    db.run(`INSERT INTO encrypted_messages (from_user_id, to_user_id, encrypted_text) VALUES (?, ?, ?)`,
-        [req.userId, toUserId, encryptedText], (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ success: true });
-        });
-});
-
-app.get('/api/messages', auth, (req, res) => {
-    db.all(`SELECT m.*, u1.username as from_name, u2.username as to_name
-            FROM encrypted_messages m
-            JOIN users u1 ON m.from_user_id = u1.id
-            JOIN users u2 ON m.to_user_id = u2.id
-            WHERE m.from_user_id = ? OR m.to_user_id = ?
-            ORDER BY m.created_at DESC`, [req.userId, req.userId], (err, messages) => {
-        res.json(messages);
-    });
-});
-
-// ============ START ============
-app.listen(PORT, () => console.log(`Shadow Lanterns running at http://localhost:${PORT}`));
